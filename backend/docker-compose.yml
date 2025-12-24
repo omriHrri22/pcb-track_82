@@ -1,0 +1,12 @@
+services:
+  pcb-track-backend:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - pcbtrack_data:/data
+    environment:
+      - PCB_TRACK_DB=/data/pcb_track.db
+
+volumes:
+  pcbtrack_data:
