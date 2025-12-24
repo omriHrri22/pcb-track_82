@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { PCBBoard, UserRole, ChangeLogEntry, createNewBoard, calculateBoardProgress, migrateBoardTasks, STAGE_TEMPLATES } from './types';
+import { PCBBoard, UserRole, ChangeLogEntry, calculateBoardProgress, migrateBoardTasks, STAGE_TEMPLATES } from './types';
 import { useLocalStorage } from './hooks/useLocalStorage';
 import { BoardsOverview } from './components/BoardsOverview';
 import { BoardDetail } from './components/BoardDetail';
@@ -14,6 +14,82 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Plus, User, Users, Trash2, Download } from 'lucide-react';
 import { Toaster } from './components/ui/sonner';
 import { toast } from 'sonner';
+
+// Backend base URL:
+// - Local dev (docker compose): http://localhost:8000/api
+// - Override via Vite env: VITE_API_BASE=http://<host>:8000/api
+const API_BASE = (import.meta as any).env?.VITE_API_BASE ?? 'http://localhost:8000/api';
+
+async function apiRequest<T>(path: string, options?: RequestInit): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    headers: { 'Content-Type': 'application/json', ...(options?.headers ?? {}) },
+    ...options,
+  });
+
+  if (!res.ok) {
+    const text = await res.text().catch(() => '');
+    throw new Error(`API ${res.status}: ${text || res.statusText}`);
+  }
+
+  if (res.status === 204) return undefined as unknown as T;
+  return (await res.json()) as T;
+}
+
+function migrateBoards(bs: PCBBoard[]): PCBBoard[] {
+  return bs.map((b) => migrateBoardTasks(b));
+}
+
+async function apiGetBoards(includeDeleted = false): Promise<PCBBoard[]> {
+  return apiRequest<PCBBoard[]>(`/boards?includeDeleted=${includeDeleted ? 'true' : 'false'}`);
+}
+
+async function apiCreateBoard(payload: {
+  boardName: string;
+  partNumber: string;
+  revision: string;
+  project: string;
+  isNewRevision: boolean;
+}): Promise<PCBBoard> {
+  return apiRequest<PCBBoard>(`/boards`, { method: 'POST', body: JSON.stringify(payload) });
+}
+
+async function apiUpdateBoard(board: PCBBoard): Promise<PCBBoard> {
+  return apiRequest<PCBBoard>(`/boards/${board.id}`, { method: 'PUT', body: JSON.stringify(board) });
+}
+
+async function apiSoftDeleteBoard(boardId: string): Promise<PCBBoard> {
+  return apiRequest<PCBBoard>(`/boards/${boardId}/delete`, { method: 'POST' });
+}
+
+async function apiRestoreBoard(boardId: string): Promise<PCBBoard> {
+  return apiRequest<PCBBoard>(`/boards/${boardId}/restore`, { method: 'POST' });
+}
+
+async function apiPermanentDeleteBoard(boardId: string): Promise<void> {
+  await apiRequest<void>(`/boards/${boardId}`, { method: 'DELETE' });
+}
+
+async function apiGetChangeLog(boardId?: string): Promise<ChangeLogEntry[]> {
+  const q = boardId ? `?boardId=${encodeURIComponent(boardId)}` : '';
+  return apiRequest<ChangeLogEntry[]>(`/changelog${q}`);
+}
+
+async function apiAddChangeLog(entry: Omit<ChangeLogEntry, 'id' | 'timestamp'>): Promise<ChangeLogEntry> {
+  return apiRequest<ChangeLogEntry>(`/changelog`, { method: 'POST', body: JSON.stringify(entry) });
+}
+
+async function apiGetUsers(): Promise<string[]> {
+  return apiRequest<string[]>(`/users`);
+}
+
+async function apiAddUser(name: string): Promise<string[]> {
+  return apiRequest<string[]>(`/users`, { method: 'POST', body: JSON.stringify({ name }) });
+}
+
+async function apiRemoveUser(name: string): Promise<string[]> {
+  return apiRequest<string[]>(`/users/${encodeURIComponent(name)}`, { method: 'DELETE' });
+}
+
 
 export default function App() {
   const [boards, setBoards] = useLocalStorage<PCBBoard[]>('pcb-boards', []);
@@ -33,14 +109,42 @@ export default function App() {
     arrived: 'all',
   });
 
-  // Migrate existing boards on app load
-  useEffect(() => {
-    const migratedBoards = boards.map(board => migrateBoardTasks(board));
-    // Only update if there were actual changes
-    if (JSON.stringify(migratedBoards) !== JSON.stringify(boards)) {
-      setBoards(migratedBoards);
+// On mount:
+// 1) migrate cached boards (localStorage)
+// 2) fetch latest from backend and replace local cache
+useEffect(() => {
+  // 1) migrate cached boards (if any)
+  try {
+    const migrated = migrateBoards(boards);
+    if (JSON.stringify(migrated) !== JSON.stringify(boards)) {
+      setBoards(migrated);
     }
-  }, []); // Only run once on mount
+  } catch {
+    // ignore migration issues
+  }
+
+  // 2) fetch from backend
+  (async () => {
+    try {
+      const [serverBoards, serverLog, serverUsers] = await Promise.all([
+        apiGetBoards(true),      // include deleted so Deleted view works
+        apiGetChangeLog(),
+        apiGetUsers(),
+      ]);
+
+      const migratedServerBoards = migrateBoards(serverBoards);
+      setBoards(migratedServerBoards);
+      setChangeLog(serverLog);
+      setUserNames(serverUsers);
+    } catch (err: any) {
+      console.error('Backend fetch failed:', err);
+      toast.error(`Backend not reachable. Using local cache. (${err?.message ?? 'unknown error'})`);
+    }
+  })();
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, []);
+
 
   // Separate active and deleted boards
   const activeBoards = boards.filter(board => !board.isDeleted);
@@ -109,55 +213,125 @@ export default function App() {
     return true;
   });
 
-  const handleCreateBoard = (
-    boardName: string,
-    partNumber: string,
-    revision: string,
-    project: string,
-    isNewRevision: boolean
-  ) => {
-    const newBoard = createNewBoard(boardName, partNumber, revision, project, isNewRevision);
-    setBoards([...boards, newBoard]);
-    toast.success('Board created successfully');
-  };
+const handleCreateBoard = (
+  boardName: string,
+  partNumber: string,
+  revision: string,
+  project: string,
+  isNewRevision: boolean
+) => {
+  (async () => {
+    try {
+      const created = await apiCreateBoard({
+        boardName,
+        partNumber,
+        revision,
+        project,
+        isNewRevision,
+      });
+
+      // optional migration (keeps compatibility)
+      const migrated = migrateBoards([created])[0];
+
+      setBoards((prev) => [...prev, migrated]);
+      toast.success('Board created successfully');
+    } catch (err: any) {
+      console.error(err);
+      toast.error(`Failed to create board: ${err?.message ?? 'unknown error'}`);
+    }
+  })();
+};
+
 
   const handleUpdateBoard = (updatedBoard: PCBBoard) => {
-    setBoards(boards.map((b) => (b.id === updatedBoard.id ? updatedBoard : b)));
-  };
+  // 1) Optimistic update (UI מגיב מיד)
+  setBoards((prev) => prev.map((b) => (b.id === updatedBoard.id ? updatedBoard : b)));
+
+  // 2) Save to backend
+  (async () => {
+    try {
+      const saved = await apiUpdateBoard(updatedBoard);
+      const migratedSaved = migrateBoards([saved])[0];
+
+      // Replace with the canonical version from server
+      setBoards((prev) => prev.map((b) => (b.id === migratedSaved.id ? migratedSaved : b)));
+    } catch (err: any) {
+      console.error(err);
+      toast.error(`Failed to save changes: ${err?.message ?? 'unknown error'}`);
+    }
+  })();
+};
+
 
   const handleLogChange = (entry: Omit<ChangeLogEntry, 'id' | 'timestamp'>) => {
-    const newEntry: ChangeLogEntry = {
-      ...entry,
-      id: `log-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-      timestamp: new Date().toISOString(),
-    };
-    setChangeLog([...changeLog, newEntry]);
+  // add temporary item so UI updates immediately
+  const tmp: ChangeLogEntry = {
+    ...entry,
+    id: `tmp-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    timestamp: new Date().toISOString(),
   };
+  setChangeLog((prev) => [...prev, tmp]);
+
+  (async () => {
+    try {
+      const saved = await apiAddChangeLog(entry);
+      setChangeLog((prev) => prev.map((e) => (e.id === tmp.id ? saved : e)));
+    } catch (err: any) {
+      console.error(err);
+      toast.error(`Failed to save change log: ${err?.message ?? 'unknown error'}`);
+    }
+  })();
+};
 
   const handleDeleteBoard = (boardId: string) => {
-    setBoards(boards.map((b) => 
-      b.id === boardId 
-        ? { ...b, isDeleted: true, deletedAt: new Date().toISOString() } 
-        : b
-    ));
-    setSelectedBoard(null);
-    toast.success('Board moved to deleted items');
-  };
+  setSelectedBoard(null);
+
+  (async () => {
+    try {
+      const deleted = await apiSoftDeleteBoard(boardId);
+      const migratedDeleted = migrateBoards([deleted])[0];
+
+      setBoards((prev) => prev.map((b) => (b.id === boardId ? migratedDeleted : b)));
+      toast.success('Board moved to deleted items');
+    } catch (err: any) {
+      console.error(err);
+      toast.error(`Failed to delete board: ${err?.message ?? 'unknown error'}`);
+    }
+  })();
+};
+
 
   const handleRestoreBoard = (boardId: string) => {
-    setBoards(boards.map((b) => 
-      b.id === boardId 
-        ? { ...b, isDeleted: false, deletedAt: undefined } 
-        : b
-    ));
-    toast.success('Board restored successfully');
-  };
+  (async () => {
+    try {
+      const restored = await apiRestoreBoard(boardId);
+      const migratedRestored = migrateBoards([restored])[0];
+
+      setBoards((prev) => prev.map((b) => (b.id === boardId ? migratedRestored : b)));
+      toast.success('Board restored successfully');
+    } catch (err: any) {
+      console.error(err);
+      toast.error(`Failed to restore board: ${err?.message ?? 'unknown error'}`);
+    }
+  })();
+};
+
 
   const handlePermanentDelete = (boardId: string) => {
-    setBoards(boards.filter((b) => b.id !== boardId));
-    setChangeLog(changeLog.filter((entry) => entry.boardId !== boardId));
-    toast.success('Board permanently deleted');
-  };
+  (async () => {
+    try {
+      await apiPermanentDeleteBoard(boardId);
+
+      setBoards((prev) => prev.filter((b) => b.id !== boardId));
+      setChangeLog((prev) => prev.filter((e) => e.boardId !== boardId));
+      toast.success('Board permanently deleted');
+    } catch (err: any) {
+      console.error(err);
+      toast.error(`Failed to permanently delete board: ${err?.message ?? 'unknown error'}`);
+    }
+  })();
+};
+
 
   const handleSelectBoard = (board: PCBBoard) => {
     // Get the latest version of the board from state
@@ -440,11 +614,32 @@ export default function App() {
 
       {/* Manage users dialog */}
       <ManageUsersDialog
-        open={isManageUsersDialogOpen}
-        onOpenChange={setIsManageUsersDialogOpen}
-        userNames={userNames}
-        onUpdateUserNames={setUserNames}
-      />
+  open={isManageUsersDialogOpen}
+  onOpenChange={setIsManageUsersDialogOpen}
+  userNames={userNames}
+  onUpdateUserNames={(nextNames) => {
+    (async () => {
+      try {
+        const prev = userNames;
+        const toAdd = nextNames.filter((n) => !prev.includes(n));
+        const toRemove = prev.filter((n) => !nextNames.includes(n));
+
+        for (const n of toAdd) await apiAddUser(n);
+        for (const n of toRemove) await apiRemoveUser(n);
+
+        const refreshed = await apiGetUsers();
+        setUserNames(refreshed);
+        toast.success('Users updated');
+      } catch (err: any) {
+        console.error(err);
+        toast.error(`Failed to update users: ${err?.message ?? 'unknown error'}`);
+        setUserNames(nextNames);
+      }
+    })();
+  }}
+/>
+
+
 
       {/* Download format dialog */}
       <DownloadFormatDialog
